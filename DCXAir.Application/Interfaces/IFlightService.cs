@@ -10,7 +10,7 @@ namespace DCXAir.Application.Interfaces
 {
     public interface IFlightService
     {
-        List<Journey> SearchFlights(string origin, string destination, string currency);
+        List<Journey> SearchFlights(string origin, string destination, string currency, string type);
 
     }
 
