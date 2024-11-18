@@ -1,5 +1,6 @@
 ﻿using DCXAir.Application.Interfaces;
 using DCXAir.Domain.Entities;
+using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 using System.Text.Json;
 
@@ -9,103 +10,151 @@ namespace DCXAir.Application.Services
     {
         private readonly IFlightRepository _repository;
         private readonly IConnectionMultiplexer _redis;
+        private readonly ILogger<FlightService> _logger;
 
-        public FlightService(IFlightRepository repository, IConnectionMultiplexer redis)
+        public FlightService(IFlightRepository repository, IConnectionMultiplexer redis, ILogger<FlightService> logger)
         {
             _repository = repository;
             _redis = redis;
+            _logger = logger;
         }
 
-        public List<Journey> SearchFlights(string origin, string destination, string currency, string type)
+        public async Task<List<Journey>> SearchFlightsAsync(string origin, string destination, string currency, string type)
         {
-
-            var cacheKey = $"flights:{origin}:{destination}:{currency}:{type}";
-            var db = _redis.GetDatabase();
-
-            var cachedFlights = db.StringGet(cacheKey);
-            if (!cachedFlights.IsNullOrEmpty)
+            try
             {
-                return JsonSerializer.Deserialize<List<Journey>>(cachedFlights);
+                var cacheKey = $"flights:{origin}:{destination}:{currency}:{type}";
+                var db = _redis.GetDatabase();
+
+                var cachedFlights = db.StringGet(cacheKey);
+                if (!cachedFlights.IsNullOrEmpty)
+                {
+                    _logger.LogInformation("Vuelos obtenidos desde la caché para la clave: {CacheKey}", cacheKey);
+                    return JsonSerializer.Deserialize<List<Journey>>(cachedFlights);
+                }
+
+                _logger.LogInformation("Consultando vuelos desde el repositorio...");
+                var flights = await _repository.GetRoutesAsync();
+                List<Flight> filteredFlights = flights;
+
+                if (!string.IsNullOrEmpty(origin))
+                    filteredFlights = filteredFlights.Where(f => f.Origin == origin).ToList();
+
+                if (!string.IsNullOrEmpty(destination))
+                    filteredFlights = filteredFlights.Where(f => f.Destination == destination).ToList();
+
+                List<Journey> result;
+
+                if (type?.ToLower() == "oneway")
+                {
+                    result = GetOneWayJourneys(filteredFlights, currency);
+                }
+                else if (type?.ToLower() == "roundtrip")
+                {
+                    result = GetRoundTripJourneys(flights, filteredFlights, currency);
+                }
+                else
+                {
+                    var oneWayJourneys = GetOneWayJourneys(filteredFlights, currency);
+                    var roundTripJourneys = GetRoundTripJourneys(flights, filteredFlights, currency);
+                    result = oneWayJourneys.Concat(roundTripJourneys).ToList();
+                }
+
+                _logger.LogInformation("Guardando resultados en caché para la clave: {CacheKey}", cacheKey);
+                db.StringSet(cacheKey, JsonSerializer.Serialize(result), TimeSpan.FromHours(24));
+
+                return result;
             }
-            var flights = _repository.GetRoutes();
-            List<Flight> filteredFlights = flights;
-
-            if (!string.IsNullOrEmpty(origin))
-                 filteredFlights = filteredFlights.Where(f => f.Origin == origin).ToList();
-
-            if (!string.IsNullOrEmpty(destination))
-                filteredFlights = filteredFlights.Where(f => f.Destination == destination).ToList();
-            List<Journey> result;
-
-            if (type?.ToLower() == "oneway")
+            catch (ArgumentException ex)
             {
-                result = GetOneWayJourneys(filteredFlights, currency);
+                _logger.LogError(ex, "Error al realizar la conversión de moneda.");
+                throw new ApplicationException("Error al realizar la conversión de moneda.", ex);
             }
-            else if (type?.ToLower() == "roundtrip")
+            catch (RedisConnectionException ex)
             {
-                result = GetRoundTripJourneys(flights, filteredFlights, currency);
+                _logger.LogError(ex, "Error al conectar con el servicio de caché (Redis).");
+                throw new ApplicationException("Error al conectar con el servicio de caché (Redis).", ex);
             }
-            else
+            catch (Exception ex)
             {
-                var oneWayJourneys = GetOneWayJourneys(filteredFlights, currency);
-                var roundTripJourneys = GetRoundTripJourneys(flights, filteredFlights, currency);
-                result = oneWayJourneys.Concat(roundTripJourneys).ToList();
+                _logger.LogError(ex, "Ocurrió un error inesperado al buscar vuelos.");
+                throw new ApplicationException("Ocurrió un error inesperado al buscar vuelos.", ex);
             }
-
-            db.StringSet(cacheKey, JsonSerializer.Serialize(result), TimeSpan.FromHours(24));
-
-            return result;
         }
+
         private List<Journey> GetOneWayJourneys(List<Flight> flights, string currency)
         {
-            return flights.Select(f => new Journey
+            try
             {
-                Flights = new List<Flight> { f },
-                Origin = f.Origin,
-                Destination = f.Destination,
-                Price = ConvertCurrency(f.Price, f.Transport.FlightCarrier, currency)
-            }).ToList();
+                return flights.Select(f => new Journey
+                {
+                    Flights = new List<Flight> { f },
+                    Origin = f.Origin,
+                    Destination = f.Destination,
+                    Price = ConvertCurrency(f.Price, currency)
+                }).ToList();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error al generar los viajes de ida.");
+                throw new ApplicationException("Error al generar los viajes de ida.", ex);
+            }
         }
 
         private List<Journey> GetRoundTripJourneys(List<Flight> flights, List<Flight> filteredFlights, string currency)
         {
-            var roundTrips = new List<Journey>();
-
-            foreach (var outbound in filteredFlights)
+            try
             {
-                var returnFlights = flights.Where(f => f.Origin == outbound.Destination && f.Destination == outbound.Origin).ToList();
+                var roundTrips = new List<Journey>();
 
-                foreach (var returnFlight in returnFlights)
+                foreach (var outbound in filteredFlights)
                 {
-                    roundTrips.Add(new Journey
-                    {
-                        Flights = new List<Flight> { outbound, returnFlight },
-                        Origin = outbound.Origin,
-                        Destination = outbound.Destination,
-                        Price = ConvertCurrency(outbound.Price + returnFlight.Price, outbound.Transport.FlightCarrier, currency)
-                    });
-                }
-            }
+                    var returnFlights = flights.Where(f => f.Origin == outbound.Destination && f.Destination == outbound.Origin).ToList();
 
-            return roundTrips;
+                    foreach (var returnFlight in returnFlights)
+                    {
+                        roundTrips.Add(new Journey
+                        {
+                            Flights = new List<Flight> { outbound, returnFlight },
+                            Origin = outbound.Origin,
+                            Destination = outbound.Destination,
+                            Price = ConvertCurrency(outbound.Price + returnFlight.Price, currency)
+                        });
+                    }
+                }
+
+                return roundTrips;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error al generar los viajes de ida y vuelta.");
+                throw new ApplicationException("Error al generar los viajes de ida y vuelta.", ex);
+            }
         }
 
-
-        private double ConvertCurrency(double price, string fromCurrency, string toCurrency)
+        private double ConvertCurrency(double price, string toCurrency)
         {
-           
-            if (fromCurrency != toCurrency)
+            try
             {
-                if (toCurrency == "USD")
+                var exchangeRates = new Dictionary<string, double>
                 {
-                    return price * 1.2; 
-                }
-                else if (toCurrency == "EUR")
+                    { "USD", 1.0 },
+                    { "EUR", 0.92 },
+                    { "COP", 4200.0 }
+                };
+
+                if (!exchangeRates.ContainsKey(toCurrency))
                 {
-                    return price * 1.1; 
+                    throw new ArgumentException("Moneda no soportada");
                 }
+
+                return toCurrency == "USD" ? price : price * exchangeRates[toCurrency];
             }
-            return price; 
+            catch (ArgumentException ex)
+            {
+                _logger.LogError(ex, "Error al realizar la conversión de moneda.");
+                throw new ApplicationException("Error al realizar la conversión de moneda.", ex);
+            }
         }
     }
 }

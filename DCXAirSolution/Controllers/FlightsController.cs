@@ -1,6 +1,6 @@
-﻿using Microsoft.AspNetCore.Mvc;
-using DCXAir.Application.Interfaces;
+﻿using DCXAir.Application.Interfaces;
 using DCXAir.Domain.Entities;
+using Microsoft.AspNetCore.Mvc;
 
 namespace DCXAir.API.Controllers
 {
@@ -19,7 +19,7 @@ namespace DCXAir.API.Controllers
         /// Endpoint to search for flights based on the filters provided by user.
         /// </summary>
         [HttpGet("search")]
-        public IActionResult SearchFlights(
+        public async Task<IActionResult> SearchFlights(
             [FromQuery] string? origin,
             [FromQuery] string? destination,
             [FromQuery] string? currency,
@@ -30,14 +30,20 @@ namespace DCXAir.API.Controllers
                 return BadRequest("Debe proporcionar al menos un parámetro de búsqueda.");
             }
 
-            var journeys = _flightService.SearchFlights(origin, destination, currency, type);
-
-            if (journeys == null || journeys.Count == 0)
+            try
             {
-                return NotFound("No se encontraron vuelos que coincidan con los criterios de búsqueda.");
-            }
+                var journeys = await _flightService.SearchFlightsAsync(origin, destination, currency, type);
 
-            return Ok(journeys);
+                return Ok(journeys ?? new List<Journey>());
+            }
+            catch (ArgumentException ex)
+            {
+                return BadRequest($"Error en los parámetros de búsqueda: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Ocurrió un error inesperado: {ex.Message}");
+            }
         }
     }
 }

@@ -9,6 +9,6 @@ namespace DCXAir.Application.Interfaces
 {
     public interface IFlightRepository
     {
-        List<Flight> GetRoutes();
+        Task<List<Flight>> GetRoutesAsync();
     }
 }
